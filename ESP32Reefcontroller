@@ -1,0 +1,460 @@
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <ESPAsyncWebServer.h>
+#include <WiFi.h>
+#include <U8x8lib.h>
+#include <ESP_Mail_Client.h>  // For sending email
+
+U8X8_SSD1306_128X64_NONAME_HW_I2C display(/* reset=*/ U8X8_PIN_NONE);
+
+// Button and OLED backlight variables
+unsigned long backlightTimer = 0;
+bool backlightOn = false;
+
+// Wifi config
+// Replace with your network credentials and email info
+const char* ssid = "xxx";
+const char* password = "xxx";
+
+// Email setup
+#define SMTP_HOST "smtp.gmail.com"  // Your SMTP server
+#define SMTP_PORT 465               // SMTP port
+#define AUTHOR_EMAIL "xxx@gmail.com"  // Replace with your email
+#define AUTHOR_PASSWORD "xxx"  // Your email password or App password
+#define RECIPIENT_EMAIL "xxx@xxx.com"
+
+// Create SMTP session
+SMTPSession smtp;
+
+//Callback function to get the Email sending status
+void smtpCallback(SMTP_Status status);
+
+// Email-related variables
+bool emailSent = false;
+
+// Web Server credentials
+const char* webUser = "admin";       // Set your web server username
+const char* webPassword = "password";  // Set your web server password
+
+// Pin definitions
+#define ONE_WIRE_BUS 4  // Pin for DS18B20
+#define FLOAT_SWITCH_LOW 12  // Low-level float switch (in aquarium)
+#define FLOAT_SWITCH_HIGH 13  // High-level float switch (in aquarium)
+#define FLOAT_SWITCH_RESERVOIR 17  // Reservoir float switch
+#define PUMP_PIN 14  // Pin to control the pump
+#define BUTTON_PIN 16  // Pin for the button to toggle OLED backlight
+#define PH_PIN 25 // Analog pin for pH sensor
+
+// Relay pins
+const int relayPins[12] = {2, 5, 15, 18, 19, 34, 23, 25, 26, 27, 32, 33};
+bool relayStates[12] = {false};
+
+// Relay names: to do
+
+// OneWire and temperature setup
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+DeviceAddress probe1, probe2, probe3;
+
+// pH sensor setup
+float phValue = 0.0;
+float phCalibrationOffset = 0.0;
+
+// Calibration buffer values
+float ph4AnalogValue = 0; // Raw analog value for pH 4.01 solution
+float ph7AnalogValue = 0; // Raw analog value for pH 7.0 solution
+
+// Calibration step state
+int calibrationStep = 0;
+
+// Webserver setup
+AsyncWebServer server(80);
+
+// ATO variables
+bool lowSwitchState = false;
+bool highSwitchState = false;
+bool reservoirSwitchState = false;
+bool pumpStatus = false;
+
+unsigned long maxRunTime = 60 * 1000L;   // pump on for max of one minute
+unsigned long minOffTime = 60 * 60 * 1000L;  // pump must be off for at least one hour
+unsigned long switchDebounceTime = 3 * 1000L;  // Switch must be activated for at least 3 seconds.
+unsigned long lastPumpTime = 0;
+
+unsigned long lastLowWaterDetectTime = 0;
+boolean lastLowWaterState = HIGH;
+
+boolean pumpRunning = false;
+
+// Function to read pH value
+float readPH() {
+  int analogValue = analogRead(PH_PIN);  // Read analog input
+  float voltage = analogValue * (3.3 / 4095.0);  // Convert to voltage
+  
+  // Simple linear mapping between voltage and pH value, calibrated using offsets
+  float ph = (voltage * 3.5) + phCalibrationOffset;
+  return ph;
+}
+
+// Function to start calibration process
+void startCalibration() {
+  calibrationStep = 1;  // Move to step 1
+  Serial.println("Calibration process started. Please immerse in pH 4.0 solution.");
+}
+
+// Function to calibrate using pH 4.0 solution
+void calibratePH4() {
+  ph4AnalogValue = analogRead(PH_PIN);
+  calibrationStep = 2;  // Move to step 2
+  Serial.println("Calibrated with pH 4.0. Please immerse in pH 7.0 solution.");
+}
+
+// Function to calibrate using pH 7.0 solution
+void calibratePH7() {
+  ph7AnalogValue = analogRead(PH_PIN);
+  
+  // Calculate the pH calibration offset based on pH 4 and pH 7 buffers
+  if (ph4AnalogValue != 0 && ph7AnalogValue != 0) {
+    float phSlope = 3.0 / (ph7AnalogValue - ph4AnalogValue);  // Slope based on known pH values
+    phCalibrationOffset = 7.0 - (ph7AnalogValue * phSlope);   // Adjust offset
+    calibrationStep = 3;  // Move to success step
+    Serial.println("pH calibration completed.");
+  } else {
+    calibrationStep = 4;  // Error step
+    Serial.println("Error: Calibration values are not set. Ensure both buffers are used.");
+  }
+}
+
+// Function to send email
+void sendEmail() {
+  if (!emailSent){
+  
+      // Create session configuration
+      Session_Config config;
+      config.server.host_name = SMTP_HOST;
+      config.server.port = SMTP_PORT;
+      config.login.email = AUTHOR_EMAIL;
+      config.login.password = AUTHOR_PASSWORD;
+
+      //Set NTP config time
+      config.time.ntp_server = F("pool.ntp.org,time.nist.gov");
+      config.time.gmt_offset = 1;
+      config.time.day_light_offset = 0;
+
+      // Create email message
+      SMTP_Message message;
+      message.sender.name = "Aquarium System";
+      message.sender.email = AUTHOR_EMAIL;
+      message.subject = "ATO Reservoir Low Alert";
+      message.addRecipient("xxx", RECIPIENT_EMAIL);
+      message.text.content = "Warning: The ATO reservoir water level is low. Please refill to continue automatic top-off.";
+      message.text.charSet = F("us-ascii");
+      message.text.transfer_encoding = Content_Transfer_Encoding::enc_7bit;
+      message.priority = esp_mail_smtp_priority::esp_mail_smtp_priority_low;
+      if (!smtp.connect(&config))
+        return;
+
+      // Send email
+      if (!MailClient.sendMail(&smtp, &message)) {
+        Serial.println("Error sending Email: " + smtp.errorReason());
+      } else {
+        Serial.println("Email sent successfully");
+        emailSent = true; // Prevent multiple email until the situation is resolved
+      }
+      //to clear sending result log
+      smtp.sendingResult.clear();
+
+      ESP_MAIL_PRINTF("Free Heap: %d\n", MailClient.getFreeHeap());
+      smtp.closeSession();  // Close the SMTP session after sending the email
+
+  }
+}
+
+void smtpCallback(SMTP_Status status) {
+    // Monitor email status
+  Serial.println(status.info());
+  if (status.success()) {
+    Serial.println("Email sent successfully");
+  } else {
+    Serial.println("Failed to send email");
+  }
+  
+}
+
+// Function to control the pump
+void controlPump() {
+  lowSwitchState = digitalRead(FLOAT_SWITCH_LOW);
+  highSwitchState = digitalRead(FLOAT_SWITCH_HIGH);
+  reservoirSwitchState = digitalRead(FLOAT_SWITCH_RESERVOIR);
+
+  unsigned long currentMillis = millis();
+
+  if(lowSwitchState != lastLowWaterState){
+    lastLowWaterDetectTime = currentMillis;
+  }
+  
+  if (!reservoirSwitchState) {
+    // If the reservoir level is low, stop the pump and send an email if not already sent
+    pumpStatus = false;
+    digitalWrite(PUMP_PIN, LOW);
+    sendEmail();
+  } 
+  else {
+    emailSent = false; // Reset email fag when reservoir is refilled
+    if (pumpRunning) {  // if the pump is on then let's see if we should turn it off yet
+
+     if ((highSwitchState == HIGH) || (currentMillis - lastPumpTime >= maxRunTime)){
+      digitalWrite(PUMP_PIN, LOW);
+      pumpRunning = false;
+      lastPumpTime = currentMillis;
+      }
+    }
+  else {   // pump is not running, see if we need to turn it on
+
+      if((lowSwitchState == LOW)  &&  (currentMillis - lastLowWaterDetectTime >= switchDebounceTime) && (currentMillis - lastPumpTime > minOffTime)){   // switch is low and has been for at least 3 seconds
+        digitalWrite(PUMP_PIN, HIGH);
+        pumpRunning = true;
+        lastPumpTime = currentMillis;
+      }
+  
+  }
+  lastLowWaterState = lowSwitchState;
+  }
+}
+
+const char htmlHead[] PROGMEM = 
+  "<html>"
+  "<head>"
+  "<style>"
+  "body { font-family: Arial; text-align: center; }"
+  ".status { margin: 10px; padding: 10px; border: 1px solid #000; display: inline-block; }"
+  ".relay-btn { padding: 10px 20px; margin: 5px; border: none; cursor: pointer; font-size: 16px; }"
+  ".on { background-color: green; color: white; }"
+  ".off { background-color: red; color: white; }"
+  "</style>"
+  "<script>"
+  "function toggleRelay(relay) {"
+  "  var xhr = new XMLHttpRequest();"
+  "  xhr.open('GET', '/toggleRelay?relay=' + relay, true);"
+  "  xhr.send();"
+  "  setTimeout(function() { location.reload(); }, 500);"
+  "}"
+  "</script>"
+  "</head>"
+  "<body>"
+  "<h1>Aquarium Monitoring and Control</h1>";
+
+const char htmlFooter[] PROGMEM = "</body></html>";
+
+// Function to generate the HTML webpage with a single button per relay
+String getHtmlPage() {
+  sensors.requestTemperatures();  // Fetch temperature data
+
+  String html = FPSTR(htmlHead);
+
+  // Sensor readings section
+  html += "<div class='status'><h2>Sensor Readings</h2>";
+  html += "<p>Sump temperature: " + String(sensors.getTempC(probe1)) + " °C</p>";
+  html += "<p>Display tank temperature: " + String(sensors.getTempC(probe2)) + " °C</p>";
+  html += "<p>Room temperature: " + String(sensors.getTempC(probe3)) + " °C</p>";
+  html += "<p>pH Value: " + String(readPH()) + "</p></div>";
+
+  // Relay control section
+  html += "<div class='status'><h2>Relay Control</h2>";
+  for (int i = 0; i < 12; i++) {
+    String relayClass = digitalRead(relayPins[i]) == HIGH ? "on" : "off";
+    String relayState = digitalRead(relayPins[i]) == HIGH ? "ON" : "OFF";
+    html += "<button class='relay-btn " + relayClass + "' onclick='toggleRelay(" + String(i) + ")'>Relay " + String(i + 1) + " (" + relayState + ")</button><br>";
+  }
+  html += "</div>";
+
+  // Calibration control
+  html += "<div class='status'><h2>Calibration</h2>";
+  
+  if (calibrationStep == 0) {
+    // Initial button to start the calibration
+    html += "<form action='/startCalibration' method='POST'><input type='submit' value='Start Calibration'></form>";
+  } 
+  else if (calibrationStep == 1) {
+    // pH 4 calibration step
+    html += "<form action='/calibratePH4' method='POST'><input type='submit' value='Calibrate pH 4.0'></form>";
+    html += "<p>Please immerse the probe in pH 4.0 buffer solution.</p>";
+  } 
+  else if (calibrationStep == 2) {
+    // pH 7 calibration step
+    html += "<form action='/calibratePH7' method='POST'><input type='submit' value='Calibrate pH 7.0'></form>";
+    html += "<p>Please immerse the probe in pH 7.0 buffer solution.</p>";
+  } 
+  else if (calibrationStep == 3) {
+    // Calibration successful
+    html += "<p>Calibration successful!</p>";
+    html += "<form action='/resetCalibration' method='GET'><input type='submit' value='Return to Main Page'></form>";
+  } 
+  else if (calibrationStep == 4) {
+    // Calibration failed
+    html += "<p>Error: Calibration failed.</p>";
+    html += "<form action='/resetCalibration' method='GET'><input type='submit' value='Return to Main Page'></form>";
+  }
+
+  html += FPSTR(htmlFooter);  // Add footer
+
+  return html;
+}
+
+// Function to toggle the relay
+void handleRelayToggle(AsyncWebServerRequest *request) {
+  if (request->hasParam("relay")) {
+    int relay = request->getParam("relay")->value().toInt();
+
+    // Toggle the relay state
+    if (relay >= 0 && relay < 12) {
+      int currentState = digitalRead(relayPins[relay]);
+      digitalWrite(relayPins[relay], !currentState);  // Toggle relay (on/off)
+    }
+  }
+  request->send(200, "text/plain", "OK");  // Simple response without redirect
+}
+
+// Function to serve the main webpage after login
+void handleRoot(AsyncWebServerRequest *request) {
+  if (!request->authenticate(webUser, webPassword)) {
+    return request->requestAuthentication();  // Trigger login prompt if not authenticated
+  }
+  request->send(200, "text/html", getHtmlPage());
+}
+
+// Handle calibration requests
+void handleStartCalibration(AsyncWebServerRequest *request) {
+  startCalibration();
+  request->redirect("/");  // Redirect back to main page after starting calibration
+}
+
+void handlePH4Calibration(AsyncWebServerRequest *request) {
+  calibratePH4();
+  request->redirect("/");  // Redirect back to main page after calibration
+}
+
+void handlePH7Calibration(AsyncWebServerRequest *request) {
+  calibratePH7();
+  request->redirect("/");  // Redirect back to main page after calibration
+}
+
+void setup() {
+  // Initialize serial for debugging
+  Serial.begin(115200);
+
+  
+  // Initialize OLED display (U8x8)
+  display.begin();
+  display.setPowerSave(0);  // Turn on the display
+  display.setFont(u8x8_font_chroma48medium8_r); // Set font
+  
+  display.drawString(0, 0, "Starting...");  // Display initial message
+
+  // Initialize DS18B20 sensors
+  sensors.begin();
+  sensors.getAddress(probe1, 0);
+  sensors.getAddress(probe2, 1);
+  sensors.getAddress(probe3, 2);
+
+  // Initialize float switch pins and pump pin
+  pinMode(FLOAT_SWITCH_LOW, INPUT_PULLUP);
+  pinMode(FLOAT_SWITCH_HIGH, INPUT_PULLUP);
+  pinMode(FLOAT_SWITCH_RESERVOIR, INPUT_PULLUP);
+  pinMode(PUMP_PIN, OUTPUT);
+  digitalWrite(PUMP_PIN, LOW);  // Ensure pump is off initially
+
+  for (int i = 0; i < 12; i++) {
+    pinMode(relayPins[i], OUTPUT);
+    digitalWrite(relayPins[i], LOW);
+  }
+
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.println("Connecting to WiFi...");
+  }
+  Serial.println("Connected to WiFi");
+
+  // Display IP address on Serial Monitor
+  Serial.print("Web Server IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // Show the IP address on the OLED display
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.print("IP Address:");
+  display.setCursor(0, 10);
+  display.print(WiFi.localIP());
+  display.display();
+  
+  // Webpage for browser access with login protection
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/toggleRelay", HTTP_GET, handleRelayToggle);
+  server.on("/startCalibration", HTTP_POST, [](AsyncWebServerRequest *request){
+  startCalibration();
+  request->redirect("/");  // Return to the main page to load the next step
+});
+
+server.on("/calibratePH4", HTTP_POST, [](AsyncWebServerRequest *request){
+  calibratePH4();
+  request->redirect("/");  // Return to the main page
+});
+
+server.on("/calibratePH7", HTTP_POST, [](AsyncWebServerRequest *request){
+  calibratePH7();
+  request->redirect("/");  // Return to the main page
+});
+
+server.on("/resetCalibration", HTTP_GET, [](AsyncWebServerRequest *request){
+  calibrationStep = 0;  // Reset calibration
+  request->redirect("/");  // Return to main page
+});
+
+  // Start server
+  server.begin();
+    smtp.debug(1); // Enable debugging
+  MailClient.networkReconnect(true); // Ensure reconnection
+
+  // Set callback function to monitor email status
+  smtp.callback(smtpCallback);
+}
+
+void updateDisplay() {
+  sensors.requestTemperatures();  // Get updated temperature readings
+  
+  display.clear();  // Clear the display
+  
+  // Show the IP Address
+  display.drawString(0, 0, WiFi.localIP().toString().c_str());
+
+  // Display Sensor Readings
+  char tempBuffer[16];
+  
+  snprintf(tempBuffer, sizeof(tempBuffer), "Sump: %.1f C", sensors.getTempC(probe1));
+  display.drawString(0, 1, tempBuffer);
+  
+  snprintf(tempBuffer, sizeof(tempBuffer), "Tank: %.1f C", sensors.getTempC(probe2));
+  display.drawString(0, 2, tempBuffer);
+  
+  snprintf(tempBuffer, sizeof(tempBuffer), "Room: %.1f C", sensors.getTempC(probe3));
+  display.drawString(0, 3, tempBuffer);
+
+  snprintf(tempBuffer, sizeof(tempBuffer), "pH: %.1f", readPH() );
+  display.drawString(0, 4, tempBuffer);
+
+}
+
+void loop() {
+  // Update pump control
+  controlPump();
+
+  // Update the OLED display with the current statuses
+  updateDisplay();
+
+  // Delay between readings (adjust as needed)
+  delay(5000);
+}
+
+
